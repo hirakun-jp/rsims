@@ -36,6 +36,16 @@
 #' and whose remaining columns are named for the tickers, for a rate that varies
 #' by day. A date-keyed input must cover exactly the simulated dates. Tickers not
 #' named get zero. Defaults to zero.
+#' @param long_financing_costs Annualised financing costs on long positions as a
+#' decimal fraction, for a broker that charges interest on the value of a
+#' margin-bought position rather than on a negative cash balance (SBI
+#' Securities' US margin trading charges 4.5% a year on the position). Same
+#' forms as `short_borrow_costs`. It accrues over calendar days, not rows:
+#' yesterday's long positions at today's price are charged for the days since
+#' the previous row, and a newly bought long is charged one more day, because
+#' such brokers count both the opening and the closing settlement dates. Pass
+#' `broker_interest_spread = 0` and no `interest_rates` when the broker charges
+#' nothing on the cash balance itself. Defaults to zero.
 #' @param trade_buffer Trade buffer parameter (see details)
 #' @param initial_cash Inital cash balance
 #' @param capitalise_profits If TRUE, utilise profits and initial cash balance in determining position sizes. If FALSE, profits accrue as a cash balance and are not reinvested.
@@ -83,6 +93,10 @@
 #'  short_borrow: Borrow costs from holding yesterday's short positions through
 #'  today's close. ALWAYS ZERO OR NEGATIVE, because it is computed from a
 #'  negative share position. Added to cash.
+#'  long_financing: Financing costs from holding yesterday's long positions
+#'  through today's close, plus one day on today's new longs (see
+#'  `long_financing_costs`). ALWAYS ZERO OR NEGATIVE, like `short_borrow`.
+#'  Added to cash.
 #'
 #'  Note the asymmetry, because it catches people. `interest` and `short_borrow`
 #'  are signed adjustments to cash, where negative means money left. `commission`
@@ -143,7 +157,7 @@
 #'   )
 #' }
 #' @export
-min_commission_backtest <- function(prices, unadjusted_prices, target_weights, interest_rates = NULL, short_borrow_costs = NULL, trade_buffer = 0., initial_cash = 10000, capitalise_profits = FALSE, include_initial_state = FALSE, commission_fun, ..., broker_interest_spread = 1.0/(100*365), maint_margin = 0.25) {
+min_commission_backtest <- function(prices, unadjusted_prices, target_weights, interest_rates = NULL, short_borrow_costs = NULL, long_financing_costs = NULL, trade_buffer = 0., initial_cash = 10000, capitalise_profits = FALSE, include_initial_state = FALSE, commission_fun, ..., broker_interest_spread = 1.0/(100*365), maint_margin = 0.25) {
 
   if(!is.numeric(broker_interest_spread) || length(broker_interest_spread) != 1 || broker_interest_spread < 0)
     stop("broker_interest_spread must be a single non-negative daily rate")
@@ -185,6 +199,7 @@ min_commission_backtest <- function(prices, unadjusted_prices, target_weights, i
   # Either a constant named vector or a date-keyed matrix, coerced to one
   # per-day per-asset matrix in tickers order so the loop below is uniform.
   short_borrow_costs <- build_borrow_matrix(short_borrow_costs, prices, tickers)
+  long_financing_costs <- build_borrow_matrix(long_financing_costs, prices, tickers)
 
   rowlist <- vector(mode = "list", length = nrow(target_weights))  # preallocate list to store daily backtest data
 
@@ -194,6 +209,7 @@ min_commission_backtest <- function(prices, unadjusted_prices, target_weights, i
   share_value <- rep(0, num_assets)
   cap_equity <- initial_cash
   previous_weights <- rep(0, num_assets)
+  previous_date <- NA
 
   # Iterate through prices and backtest
   for (i in 1:(nrow(target_weights))) {
@@ -212,9 +228,13 @@ min_commission_backtest <- function(prices, unadjusted_prices, target_weights, i
     )
     # short borrow is debited based on holding yesterday's positions to today's close
     short_borrow <- short_borrow_costs[i, ]/365 * ifelse(share_pos >= 0, 0, share_pos*current_price)
+    # long financing is debited on yesterday's long positions for the calendar days since the previous row
+    days_held <- if (is.na(previous_date)) 0 else as.numeric(current_date) - as.numeric(previous_date)
+    long_financing <- -long_financing_costs[i, ]/365 * days_held * ifelse(share_pos > 0, share_pos*current_price, 0)
+    previous_long_shares <- pmax(share_pos, 0)
 
     # update cash and total equity
-    Cash <- Cash + interest + sum(short_borrow, na.rm = TRUE)
+    Cash <- Cash + interest + sum(short_borrow, na.rm = TRUE) + sum(long_financing, na.rm = TRUE)
     equity <- sum(share_pos * current_price, na.rm = TRUE) + Cash
 
     if(equity > 0) {
@@ -285,6 +305,11 @@ min_commission_backtest <- function(prices, unadjusted_prices, target_weights, i
       Cash <- Cash - sum(trade_value, na.rm = TRUE) - sum(commissions, na.rm = TRUE)
       share_pos <- target_shares
       share_value <- share_pos * current_price
+      # a new long is charged for its opening settlement date as well
+      opening_financing <- -long_financing_costs[i, ]/365 * pmax(pmax(share_pos, 0) - previous_long_shares, 0) * current_price
+      opening_financing[is.na(opening_financing)] <- 0
+      long_financing <- long_financing + opening_financing
+      Cash <- Cash + sum(opening_financing)
       equity <- sum(share_value, na.rm = TRUE) + Cash
       short_position_market_values <- ifelse(share_pos < 0, share_pos*current_price, 0)
       short_proceeds_collateral = sum(abs(short_position_market_values))
@@ -329,23 +354,25 @@ min_commission_backtest <- function(prices, unadjusted_prices, target_weights, i
         c(0, commissions + liq_commissions),
         c(interest, rep(0, num_assets)),
         c(0, short_borrow),
+        c(0, long_financing),
         rep(margin_call, num_assets+1),   # bool will be stored as int (1-0)
         rep(reduced_target_pos, num_assets+1)
       ),
       nrow = num_assets + 1,
-      ncol = 11,
+      ncol = 12,
       byrow = FALSE,
       dimnames = list(
         # tickers are row names
         c("Cash", tickers),
         # column names
-        c("date", "close", "shares", "exposure", "share_trades", "trade_value", "commission", "interest", "short_borrow", "margin_call", "reduced_target_pos")
+        c("date", "close", "shares", "exposure", "share_trades", "trade_value", "commission", "interest", "short_borrow", "long_financing", "margin_call", "reduced_target_pos")
       )
     )
 
     rowlist[[i]] <- row_mat
 
     previous_weights <- current_weights
+    previous_date <- current_date
   }
 
   # Optionally prepend initial state (t=0)
@@ -361,15 +388,16 @@ min_commission_backtest <- function(prices, unadjusted_prices, target_weights, i
         rep(0, num_assets+1),                          # No commission
         rep(0, num_assets+1),                          # No interest
         rep(0, num_assets+1),                          # No short borrow
+        rep(0, num_assets+1),                          # No long financing
         rep(FALSE, num_assets+1),                      # No margin call
         rep(FALSE, num_assets+1)                       # No reduced target
       ),
       nrow = num_assets + 1,
-      ncol = 11,
+      ncol = 12,
       byrow = FALSE,
       dimnames = list(
         c("Cash", tickers),
-        c("date", "close", "shares", "exposure", "share_trades", "trade_value", "commission", "interest", "short_borrow", "margin_call", "reduced_target_pos")
+        c("date", "close", "shares", "exposure", "share_trades", "trade_value", "commission", "interest", "short_borrow", "long_financing", "margin_call", "reduced_target_pos")
       )
     )
     rowlist <- c(list(initial_row), rowlist)

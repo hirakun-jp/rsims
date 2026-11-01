@@ -277,3 +277,22 @@ test_that("Known results are correct", {
 #
 #   testthat::expect_equal(results_df, test_results, tolerance = 1e-6)
 # })
+
+test_that("long financing accrues over calendar days plus the opening day", {
+  d <- as.numeric(as.Date(c("2026-09-22", "2026-09-23", "2026-09-28", "2026-09-30")))
+  prices <- cbind(Date = d, TLT = c(80, 80, 80, 80))
+  weights <- cbind(Date = d, TLT = c(0, 1, 1, 0))
+  results <- min_commission_backtest(
+    prices, prices, weights,
+    long_financing_costs = c(TLT = 0.045),
+    trade_buffer = 0.5,
+    initial_cash = 8000,
+    commission_fun = sbi_us_margin_commission,
+    broker_interest_spread = 0
+  )
+  tlt <- results[results$ticker == "TLT", ]
+  # 100 shares at 80: one opening day, then 5 and 2 calendar days held
+  expect_equal(-sum(tlt$long_financing), 8000 * 0.045 * (1 + 5 + 2) / 365)
+  expect_equal(tlt$commission[2], 16.5)
+  expect_equal(sum(results$interest), 0)
+})

@@ -10,12 +10,15 @@ min_commission_backtest(
   target_weights,
   interest_rates = NULL,
   short_borrow_costs = NULL,
+  long_financing_costs = NULL,
   trade_buffer = 0,
   initial_cash = 10000,
   capitalise_profits = FALSE,
   include_initial_state = FALSE,
   commission_fun,
-  ...
+  ...,
+  broker_interest_spread = 1/(100 * 365),
+  maint_margin = 0.25
 )
 }
 \arguments{
@@ -31,12 +34,29 @@ timestamp or index.}
 \item{interest_rates}{Matrix of daily interest rates applied to unused cash
 (positive interest) and borrowed cash (negative interest). If not passed,
 assumes constant interest rate of zero.
-Symmetric broker spread of 1.5\% pa applied to both credit and debit cash balances.
-Conservative for large accounts; asymmetric in reality (debit spread > credit spread).}
+A symmetric broker spread (see \code{broker_interest_spread}) is applied to both
+credit and debit cash balances. Conservative for large accounts; asymmetric
+in reality (debit spread > credit spread).}
 
-\item{short_borrow_costs}{Named vector of annualised short borrow costs as percent. For
-example, c("TLT" = 0.0025) is equivalent to a short borrow cost of 0.25\%pa for
-TLT. Defaults to zero.}
+\item{short_borrow_costs}{Annualised short borrow costs as a decimal fraction,
+so c("TLT" = 0.0025) is 0.25\% a year. This is the borrow \strong{fee}, the amount
+you pay; the rebate is not modelled separately, since short sale proceeds are
+held as collateral and earn nothing. Either a named vector, for a rate that is
+constant through time, or a matrix or data frame whose first column is a date
+and whose remaining columns are named for the tickers, for a rate that varies
+by day. A date-keyed input must cover exactly the simulated dates. Tickers not
+named get zero. Defaults to zero.}
+
+\item{long_financing_costs}{Annualised financing costs on long positions as a
+decimal fraction, for a broker that charges interest on the value of a
+margin-bought position rather than on a negative cash balance (SBI
+Securities' US margin trading charges 4.5\% a year on the position). Same
+forms as \code{short_borrow_costs}. It accrues over calendar days, not rows:
+yesterday's long positions at today's price are charged for the days since
+the previous row, and a newly bought long is charged one more day, because
+such brokers count both the opening and the closing settlement dates. Pass
+\code{broker_interest_spread = 0} and no \code{interest_rates} when the broker charges
+nothing on the cash balance itself. Defaults to zero.}
 
 \item{trade_buffer}{Trade buffer parameter (see details)}
 
@@ -54,6 +74,24 @@ trades}
 commission as a percentage of order value), \code{min_dollars_per_order} (the
 minimum commission in dollars of a single order), \code{dollars_per_share} (the
 per-share cost in dollars - for IB fixed tier, 0.005 is reasonable).}
+
+\item{broker_interest_spread}{Daily broker spread applied symmetrically to
+the cash balance: credit balances earn \code{interest_rate - broker_interest_spread}
+(floored at zero) and debit balances are charged
+\code{interest_rate + broker_interest_spread}. Express as a daily rate, e.g.
+\code{1.0/(100*365)} for 1\% per annum. Defaults to 1\% pa, which is retail-like;
+prime brokerage relationships are typically materially tighter. Must be
+matched by full name as it follows \code{...}.}
+
+\item{maint_margin}{Maintenance margin requirement as a fraction of the gross
+value of positions held. Equity below \code{maint_margin * gross} triggers a
+simulated margin call; target positions are also scaled back so that
+post-trade gross does not exceed \code{equity / maint_margin}. This therefore
+imposes a hard ceiling of \code{1 / maint_margin} on gross leverage. Defaults to
+0.25 (Reg-T-like, ceiling of 4x). Portfolio margin on a hedged, diversified
+book is typically far more permissive - values of 0.10-0.15 are not unusual -
+so set this to match your broker's actual treatment rather than accepting the
+default. Must be matched by full name as it follows \code{...}.}
 }
 \value{
 long dataframe of results consisting of the following columns:
@@ -67,10 +105,32 @@ were liquidated fully or partially.
 trade_value: Value of shares traded, including any positions that
 were liquidated fully or partially.
 commission: Commissions paid on today's trading, including any liquidated
-positions.
+positions. ALWAYS POSITIVE - it is the magnitude of a cost, and the
+simulation subtracts it: \code{Cash <- Cash - sum(trade_value) - sum(commissions)}.
 interest: Interest accrued on yesterday's cash balance and settled today.
+SIGNED - positive when credited on a positive cash balance, negative when
+debited on a borrowed one. Added to cash.
 short_borrow: Borrow costs from holding yesterday's short positions through
-today's close.
+today's close. ALWAYS ZERO OR NEGATIVE, because it is computed from a
+negative share position. Added to cash.
+long_financing: Financing costs from holding yesterday's long positions
+through today's close, plus one day on today's new longs (see
+\code{long_financing_costs}). ALWAYS ZERO OR NEGATIVE, like \code{short_borrow}.
+Added to cash.
+
+Note the asymmetry, because it catches people. \code{interest} and \code{short_borrow}
+are signed adjustments to cash, where negative means money left. \code{commission}
+is the only one expressed as a positive magnitude. Summing all three as
+though they shared a convention gives an answer wrong by twice the
+commission. Negate \code{commission} first if you want one comparable series:
+
+costs <- results \%>\%
+group_by(date) \%>\%
+summarise(commission   = -sum(commission, na.rm = TRUE),
+interest     =  sum(interest, na.rm = TRUE),
+short_borrow =  sum(short_borrow, na.rm = TRUE))
+
+after which all three are negative when they cost you money.
 margin_call: Boolean indicating whether a margin call occurred today.
 reduced_target_pos: Boolean indicating whether target positions could not be
 executed due to insufficient margin, and were scaled back accordingly.
