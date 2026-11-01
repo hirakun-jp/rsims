@@ -296,3 +296,21 @@ test_that("long financing accrues over calendar days plus the opening day", {
   expect_equal(tlt$commission[2], 16.5)
   expect_equal(sum(results$interest), 0)
 })
+
+test_that("Japanese tax nets a year's gains and losses and carries losses forward", {
+  results <- tibble::tibble(
+    ticker = c("TLT", "TLT", "TLT", "TLT", "Cash"),
+    date = as.Date(c("2025-03-01", "2025-06-01", "2026-03-01", "2026-06-01", "2026-06-01")),
+    close = c(100, 90, 100, 130, 0),
+    share_trades = c(10, -10, 10, -10, 0),
+    commission = c(0, 0, 0, 0, 0),
+    interest = c(0, 0, 0, 0, -10),
+    short_borrow = 0,
+    long_financing = 0
+  )
+  tax <- jp_realised_gains_tax(results)
+  expect_equal(tax$realised, c(-100, 290))
+  expect_equal(tax$loss_used, c(0, 100))
+  expect_equal(tax$tax, c(0, 0.20315 * 190))
+  expect_equal(jp_realised_gains_tax(results, carry_forward_years = 0)$tax[2], 0.20315 * 290)
+})
